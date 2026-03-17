@@ -72,12 +72,23 @@ def load_safetensors_from_folder(folder_path: str) -> Dict[str, torch.Tensor]:
 
 def detect_layer_prefix_and_config(config_dict: dict, weights: Dict[str, torch.Tensor]) -> str:
     num_layers = None
+    text_config = config_dict.get("text_config", {})
     for key in ["num_hidden_layers", "n_layer", "num_layers"]:
-        if key in config_dict:
-            num_layers = config_dict[key]
+        if key in text_config:
+            num_layers = text_config[key]
             break
+
     if num_layers is None:
-        raise ValueError("Cannot find layer count in config.json")
+        for key in ["num_hidden_layers", "n_layer", "num_layers"]:
+            if key in config_dict:
+                num_layers = config_dict[key]
+                break
+
+    if num_layers is None:
+        raise ValueError(
+            "Cannot find layer count in config.json. "
+            "Check if 'num_hidden_layers'/'n_layer'/'num_layers' exists in root or 'text_config' subdict."
+        )
 
     candidates = [
         "model.layers.",
@@ -86,20 +97,35 @@ def detect_layer_prefix_and_config(config_dict: dict, weights: Dict[str, torch.T
         "decoder.block.",
         "gpt_neox.layers.",
         "blocks.",
+        "model.language_model.layers.",
     ]
 
+    # Check hardcoded candidates first
     for prefix in candidates:
-        if any(k.startswith(f"{prefix}0.") for k in weights):
-            return prefix
+        layer_count = sum(1 for i in range(num_layers) if any(k.startswith(f"{prefix}{i}.") for k in weights))
+        if layer_count > 0:
+            # Only return this prefix if it has a significant portion of the expected layers
+            if layer_count >= num_layers * 0.5:  # At least 50% of layers
+                return prefix
 
+    # Fallback: search for any prefix with layer pattern
+    prefix_counts = {}
     for k in weights:
-        if ".0." in k:
-            parts = k.split(".")
-            for i, part in enumerate(parts):
-                if part == "0":
-                    guessed = ".".join(parts[:i])
-                    if any(f"{guessed}.{idx}." in w for idx in range(min(2, num_layers)) for w in weights):
-                        return guessed + "."
+        for i in range(num_layers):
+            pattern = f".{i}."
+            if pattern in k:
+                parts = k.split(".")
+                for j, part in enumerate(parts):
+                    if part == str(i) and j > 0:
+                        guessed = ".".join(parts[:j]) + "."
+                        prefix_counts[guessed] = prefix_counts.get(guessed, 0) + 1
+                        break
+    
+    if prefix_counts:
+        # Return the prefix that appears most frequently
+        best_prefix = max(prefix_counts, key=prefix_counts.get)
+        return best_prefix
+    
     raise ValueError("Could not auto-detect layer prefix from weights.")
 
 
@@ -215,7 +241,7 @@ def main():
         layer_prefix = detect_layer_prefix_and_config(config, raw_weights)
         print(f"Detected layer prefix: '{layer_prefix}'")
 
-        num_layers_orig = config.get("num_hidden_layers") or config.get("n_layer") or config.get("num_layers")
+        num_layers_orig = config.get("num_hidden_layers") or config.get("n_layer") or config.get("num_layers") or config.get("text_config", {}).get("num_hidden_layers")
         if num_layers_orig is None:
             raise ValueError("Cannot find layer count in config.json")
 
@@ -242,11 +268,27 @@ def main():
         save_layer_safetensors(filtered_weights, new_weight_path)
 
         new_num_layers = len(selected_layers)
-        config["num_hidden_layers"] = new_num_layers
-        if "n_layer" in config:
-            config["n_layer"] = new_num_layers
-        if "num_layers" in config:
-            config["num_layers"] = new_num_layers
+        if new_num_layers == 0:
+            raise ValueError("selected_layers 不能为空，请选择至少1层")
+        
+        if "text_config" in config:
+            config["text_config"]["num_hidden_layers"] = new_num_layers
+            if "n_layer" in config["text_config"]:
+                config["text_config"]["n_layer"] = new_num_layers
+            if "num_layers" in config["text_config"]:
+                config["text_config"]["num_layers"] = new_num_layers
+
+            if "layer_types" in config["text_config"]:
+                original_layer_types = config["text_config"]["layer_types"]
+                original_num_layers = config["text_config"].get("num_hidden_layers", len(original_layer_types))
+                config["text_config"]["layer_types"] = original_layer_types[:new_num_layers]
+        else:
+            config["num_hidden_layers"] = new_num_layers
+            if "n_layer" in config:
+                config["n_layer"] = new_num_layers
+            if "num_layers" in config:
+                config["num_layers"] = new_num_layers
+
         with open(config_path, "w", encoding="utf-8") as f:
             json.dump(config, f, indent=2)
         print(f"Updated config.json with num_hidden_layers={new_num_layers}")
